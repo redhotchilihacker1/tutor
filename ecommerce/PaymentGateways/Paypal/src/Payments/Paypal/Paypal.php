@@ -1,0 +1,404 @@
+<?php
+
+namespace Ollyo\PaymentHub\Payments\Paypal;
+
+use Throwable;
+use ErrorException;
+use Ollyo\PaymentHub\Core\Support\Arr;
+use Ollyo\PaymentHub\Core\Payment\BasePayment;
+use Ollyo\PaymentHub\Exceptions\NotFoundException;
+use Ollyo\PaymentHub\Contracts\Config\RepositoryContract;
+use Tutor\PaymentGateways\Exceptions\HttpRequestException;
+use Tutor\PaymentGateways\Utils;
+
+/**
+ * Paypal payment gateway.
+ *
+ * Creates one-time and recurring PayPal orders, handles webhooks and processes refunds.
+ *
+ * @since 3.0.0
+ * @since 4.2.0 Uses \Tutor\PaymentGateways\Utils and HttpRequestException instead of System and Guzzle.
+ */
+class Paypal extends BasePayment {
+
+	/**
+	 * The Paypal config Repository instance
+	 *
+	 * @var   RepositoryContract
+	 * @since 3.0.0
+	 */
+	protected $config;
+
+	/**
+	 * The ID of the current order being processed.
+	 *
+	 * @var   string|null
+	 * @since 3.0.0
+	 */
+	protected $orderID;
+
+	/**
+	 * The payload from a previous transaction, used in recurring payments.
+	 *
+	 * @var   object|null
+	 * @since 3.0.0
+	 */
+	protected $previousPayload;
+
+	/**
+	 * The API endpoint URL used to process PayPal refund requests.
+	 *
+	 * @var   string|null
+	 * @since 3.9.0
+	 */
+	protected $refundLink;
+
+	/**
+	 * PayPal webhook event types handled by this gateway.
+	 *
+	 * @since 3.0.0
+	 */
+	const CHECKOUT_ORDER_APPROVED   = 'CHECKOUT.ORDER.APPROVED';
+	const PAYMENT_CAPTURE_COMPLETED = 'PAYMENT.CAPTURE.COMPLETED';
+	const PAYMENT_CAPTURE_REFUNDED  = 'PAYMENT.CAPTURE.REFUNDED';
+
+	/**
+	 * Checks if all required configuration keys are present and not empty.
+	 *
+	 * This method ensures that the necessary configuration settings are available
+	 * and properly set up before proceeding with any operations that depend on them.
+	 *
+	 * @return bool Returns true if all required configuration keys are present and not empty, otherwise false.
+	 * @since  3.0.0
+	 */
+	public function check(): bool {
+		$configKeys = Arr::make( array( 'client_id', 'client_secret', 'merchant_email', 'webhook_id' ) );
+
+		$isConfigOk = $configKeys->every(
+			function ( $key ) {
+				return $this->config->has( $key ) && ! empty( $this->config->get( $key ) );
+			}
+		);
+
+		return $isConfigOk;
+	}
+
+	/**
+	 * Sets up the PayPal API client and requests an access token.
+	 *
+	 * @since 3.0.0
+	 *
+	 * @return void
+	 *
+	 * @throws Throwable If the access token request fails.
+	 */
+	public function setup(): void {
+
+		try {
+			new Api( $this->config );
+		} catch ( Throwable $error ) {
+			throw $error;
+		}
+	}
+
+	/**
+	 * Sets the data for processing after preparing it.
+	 *
+	 * This method overrides the setData method in the parent class,
+	 * ensuring that the data is first prepared before setting it.
+	 * If an error occurs during data preparation, it is re-thrown.
+	 *
+	 * @param  object $data The data to be set.
+	 * @throws Throwable        If an error occurs during data preparation, it is re-thrown.
+	 * @since  3.0.0
+	 */
+	public function setData( $data ): void {
+		try {
+			$type = $data->type ?? 'one-time';
+
+			if ( 'refund' === $type ) {
+				parent::setData( $this->prepareDataForRefund( $data ) );
+			} else {
+				parent::setData( $this->prepareData( $data ) );
+			}
+		} catch ( Throwable $error ) {
+			throw $error;
+		}
+	}
+
+	/**
+	 * Prepares the data for sending to `Paypal Server`.
+	 *
+	 * This method takes raw data, processes it to create structured purchase unit data
+	 * including amount, shipping information, and payment preferences. It uses configuration
+	 * settings and ensures essential fields are set correctly.
+	 *
+	 * @param  object $data The raw data to be processed.
+	 * @return array        The structured data for sending to `Paypal Server`.
+	 * @since  3.0.0
+	 * @since  4.2.0 Adds Tutor merchant metadata to the purchase unit description.
+	 */
+	public function prepareData( $data ): array {
+
+		$this->orderID  = $data->order_id;
+		$type           = $data->type ?? 'one-time';
+		$items          = 'one-time' === $type ? Helper::getItems( $data ) : null;
+		$amount         = 'one-time' === $type ? Helper::createAmountData( $data ) : Helper::createAmountForRecurring( $data );
+		$tutor_metadata = Utils::prepareMerchantMetadata( $data->order_user_id, $this->config->get( 'mode' ) );
+		$description    = implode(
+			',',
+			array_map(
+				fn ( $key, $value ) => "{$key}: {$value}",
+				array_keys( $tutor_metadata ),
+				$tutor_metadata
+			)
+		);
+
+		$returnData = array(
+			'purchase_units' => array(
+				array(
+					'custom_id'   => $data->order_id,
+					'items'       => $items,
+					'amount'      => $amount,
+					'payee'       => array( 'email_address' => $this->config->get( 'merchant_email' ) ),
+					'description' => $description,
+				),
+			),
+			'intent'         => 'CAPTURE',
+		);
+
+		if ( 'one-time' === $type ) {
+			Helper::getPaymentSourceForOneTime( $returnData, $this->config );
+
+		} elseif ( 'recurring' === $type ) {
+
+			$this->previousPayload = json_decode( stripslashes( $data->previous_payload ) );
+			Helper::getPaymentSourceForRecurring( $returnData, $this->previousPayload );
+		}
+
+		if ( isset( $data->shipping_address ) && ! empty( $data->shipping_address ) ) {
+			$returnData['purchase_units'][0]['shipping'] = Helper::getShippingInfo( $data->shipping_address );
+		}
+
+		return $returnData;
+	}
+
+	/**
+	 * Initiates the payment creation process.
+	 *
+	 * This method retrieves an access token and use the token to return a checkout URL.
+	 * If an error occurs during these operations, it handles the error and throws an exception.
+	 *
+	 * @throws ErrorException If there is an error retrieving the checkout URL or handling the response.
+	 * @since  3.0.0
+	 * @since  4.2.0 Catches HttpRequestException, logs the error and shows a generic message.
+	 */
+	public function createPayment() {
+		try {
+			$orderDetails = Api::createOrder( $this->getData(), $this->orderID );
+			$checkoutUrl  = isset( $orderDetails->links ) ? Helper::getUrl( $orderDetails->links, 'payer-action' ) : null;
+
+			if ( is_null( $checkoutUrl ) ) {
+				throw new ErrorException( 'Checkout Link is Invalid' );
+			}
+
+			header( "Location: {$checkoutUrl}" );
+			exit();
+		} catch ( HttpRequestException $error ) {
+
+			$error_message = Helper::handleErrorResponse( $error ) ?? $error->getMessage();
+			error_log( 'Paypal Error: ' . $error_message ); //phpcs:ignore.
+			throw new ErrorException( esc_html__( 'Something Went Wrong', 'tutor' ) );
+		}
+	}
+
+	/**
+	 * Verifies the webhook signature and processes the order data.
+	 *
+	 * This method verifies the webhook signature from the payload. If the signature is valid,
+	 * it processes the approved order. In case of an error, it handles the error
+	 * response and sets the return data accordingly.
+	 *
+	 * @param  object $payload  The payload object containing the webhook data.
+	 * @return object           Returns the processed order data or an error response.
+	 * @throws \Exception If a PayPal API request fails.
+	 * @since  3.0.0
+	 * @since  4.2.0 Catches HttpRequestException instead of Guzzle's RequestException.
+	 */
+	public function verifyAndCreateOrderData( object $payload ): object {
+		try {
+
+			if ( ! Helper::checkWebhookVariables( $payload->server ) ) {
+				return new \stdClass();
+			}
+
+			if ( ! Api::webhook_signature_validation( $payload ) ) {
+				return new \stdClass();
+			}
+
+			Api::respond_to_event();
+
+			$payload_stream = json_decode( $payload->stream );
+
+			switch ( $payload_stream->event_type ) {
+				case self::CHECKOUT_ORDER_APPROVED:
+					Api::capturePayment( $payload_stream );
+					return new \stdClass();
+
+				case self::PAYMENT_CAPTURE_COMPLETED:
+					return $this->setReturnData( $payload_stream );
+
+				case self::PAYMENT_CAPTURE_REFUNDED:
+					// $this->orderID = $paymentData->resource->custom_id;
+					// return static::processRefund($paymentData);
+					return new \stdClass();
+				default:
+					return new \stdClass();
+			}
+		} catch ( HttpRequestException $error ) {
+
+			// Handle the error response.
+			$error_message = Helper::handleErrorResponse( $error ) ?? $error->getMessage();
+			throw new \Exception( $error_message ); //phpcs:ignore
+		}
+	}
+
+	/**
+	 * Sets and returns order data based on the processing result and error message.
+	 *
+	 * Constructs order data based on the provided payload stream and optionally an error message.
+	 * If an error message is provided, sets the order data with failure status and error details.
+	 * Otherwise, sets the order data with successful transaction details from the payload stream.
+	 *
+	 * @param  object $payloadStream The payload stream object containing order and payment details.
+	 * @return object                     The constructed order data object.
+	 * @since  3.0.0
+	 * @since  4.2.0 Uses Utils::defaultOrderData() instead of System::defaultOrderData().
+	 */
+	private function setReturnData( $payloadStream ): object {
+		$returnData = Utils::defaultOrderData();
+
+		$statusMap = array(
+			'DECLINED'  => 'failed',
+			'COMPLETED' => 'paid',
+			'PENDING'   => 'pending',
+		);
+
+		$transactionInfo            = $payloadStream->resource;
+		$returnData->id             = $transactionInfo->custom_id;
+		$returnData->payment_status = $statusMap[ $transactionInfo->status ];
+		$returnData->transaction_id = $transactionInfo->id;
+		$returnData->fees           = $transactionInfo->seller_receivable_breakdown->paypal_fee->value ?? null;
+		$returnData->earnings       = $transactionInfo->seller_receivable_breakdown->net_amount->value ?? null;
+
+		$returnData->payment_payload = addslashes( json_encode( $payloadStream ) );
+		$returnData->payment_method  = $this->config->get( 'name' );
+
+		return $returnData;
+	}
+
+
+	/**
+	 * Creates a recurring payment by generating an order and handling the payment details.
+	 *
+	 * @throws ErrorException If there is an error during the payment process or request handling.
+	 * @since  3.0.0
+	 * @since  4.2.0 Catches HttpRequestException, logs the error and shows a generic message.
+	 */
+	public function createRecurringPayment() {
+		try {
+			Api::createOrder( $this->getData(), $this->orderID );
+		} catch ( HttpRequestException $error ) {
+
+			$error_message = Helper::handleErrorResponse( $error ) ?? $error->getMessage();
+			error_log( 'Paypal Error: ' . $error_message );
+			throw new ErrorException( esc_html__( 'Something Went Wrong', 'tutor' ) );
+		}
+	}
+
+	/**
+	 * Prepares the data required for a refund.
+	 *
+	 * @param  object $data The data object containing order and payment information.
+	 * @return array        Returns an array containing refund-related data.
+	 * @throws NotFoundException Throws an exception if payment payload is missing.
+	 *
+	 * @since 3.0.0
+	 */
+	private function prepareDataForRefund( $data ): array {
+		if ( ! $data->payment_payload ) {
+			throw new NotFoundException( 'Payment Payload Not Found' );
+		}
+
+		$this->orderID    = $data->order_id;
+		$paymentPayload   = json_decode( stripslashes( $data->payment_payload ) );
+		$links            = $paymentPayload->purchase_units[0]->payments->captures[0]->links ?? $paymentPayload->resource->links;
+		$this->refundLink = Helper::getUrl( $links, 'refund' );
+
+		return array(
+			'custom_id'     => (string) $data->order_id,
+			'note_to_payer' => $data->reason,
+			'amount'        => (object) array(
+				'currency_code' => $data->currency->code,
+				'value'         => number_format( $data->amount, 2, '.', '' ),
+			),
+		);
+	}
+
+	/**
+	 * Creates a refund payment by sending a refund request to PayPal and processes the response.
+	 *
+	 * @return void
+	 *
+	 * @throws ErrorException Throws an exception if an error occurs while making the HTTP request or processing the response.
+	 * @since  3.0.0
+	 * @since  4.2.0 Catches HttpRequestException instead of Guzzle's RequestException.
+	 */
+	public function createRefund() {
+
+		try {
+			Api::refund( $this->refundLink, $this->orderID, $this->getData() );
+
+		} catch ( HttpRequestException $error ) {
+			$errorMessage = Helper::handleErrorResponse( $error ) ?? $error->getMessage();
+			throw new ErrorException( esc_html( $errorMessage ) );
+		}
+	}
+
+	/**
+	 * Processes a refund payment based on the received payment data.
+	 *
+	 * @param  object $paymentData The payment data received from PayPal, containing refund information.
+	 *
+	 * @return object Returns an object containing refund-related data.
+	 *
+	 * @throws ErrorException Throws an exception if there is an error during the HTTP request or while processing the refund.
+	 * @since  1.0.0
+	 * @since  4.2.0 Uses Utils::defaultOrderData() and Api::getRefundStatus(), and catches HttpRequestException.
+	 */
+	private function processRefund( $paymentData ): object {
+		$returnData = Utils::defaultOrderData( 'refund' );
+
+		try {
+
+			$payloadStream = $paymentData->resource;
+
+			if ( strtoupper( $payloadStream->status ) === 'COMPLETED' ) {
+
+				$returnData->id             = $payloadStream->custom_id;
+				$returnData->refund_id      = $payloadStream->id;
+				$returnData->payment_method = $this->config->get( 'name' );
+				$returnData->refund_amount  = $payloadStream->amount->value;
+				$returnData->refund_payload = json_encode( $paymentData );
+			}
+
+			$returnData->refund_status = Api::getRefundStatus( $payloadStream->links, 'up' );
+
+			return $returnData;
+
+		} catch ( HttpRequestException $error ) {
+			$errorMessage = Helper::handleErrorResponse( $error ) ?? $error->getMessage();
+			throw new ErrorException( esc_html( $errorMessage ) );
+		}
+	}
+}

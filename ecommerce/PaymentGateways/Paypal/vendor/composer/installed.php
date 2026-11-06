@@ -1,0 +1,41 @@
+<?php return array(
+    'root' => array(
+        'name' => 'themeum/tutor',
+        'pretty_version' => '1.0.0',
+        'version' => '1.0.0.0',
+        'reference' => null,
+        'type' => 'library',
+        'install_path' => __DIR__ . '/../../',
+        'aliases' => array(),
+        'dev' => false,
+    ),
+    'versions' => array(
+        'brick/math' => array(
+            'pretty_version' => '0.10.2',
+            'version' => '0.10.2.0',
+            'reference' => '459f2781e1a08d52ee56b0b1444086e038561e3f',
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../brick/math',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+        'brick/money' => array(
+            'pretty_version' => '0.7.0',
+            'version' => '0.7.0.0',
+            'reference' => '3cac1b014e91718f02724c54c08a2bdcd7cd2340',
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../brick/money',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+        'themeum/tutor' => array(
+            'pretty_version' => '1.0.0',
+            'version' => '1.0.0.0',
+            'reference' => null,
+            'type' => 'library',
+            'install_path' => __DIR__ . '/../../',
+            'aliases' => array(),
+            'dev_requirement' => false,
+        ),
+    ),
+);
